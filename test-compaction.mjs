@@ -47,6 +47,67 @@ test("Anthropic-coalesced user blocks retain the compaction boundary", () => {
   ]) assert.equal(openCodeCompactionStart([user(content)]), 0)
 })
 
+test("recognize Oh-My-OpenCode compaction prompts and reject quoted or trailing action instructions", () => {
+  const omoDefault = [
+    "[USER]",
+    "[INTERNAL COMPACTION INSTRUCTION: NOT CONVERSATION HISTORY]",
+    "This message is an internal summarization control prompt, not a real user message.",
+    "",
+    "<summary>",
+    "## 1. User Requests (Verbatim)",
+    "</summary>",
+    "",
+    "IMPORTANT: Respond with ONLY the <task-intent>...</task-intent> and <summary>...</summary> blocks as your text output.",
+  ].join("\n")
+  const omoUpdate = [
+    "[USER]",
+    "<previous-summary>",
+    "Prior summary text.",
+    "</previous-summary>",
+    "",
+    "[INTERNAL COMPACTION UPDATE INSTRUCTION: NOT CONVERSATION HISTORY]",
+    "<summary>",
+    "## 1. User Requests (Verbatim)",
+    "</summary>",
+    "",
+    "IMPORTANT: Respond with ONLY the <task-intent>...</task-intent> and <summary>...</summary> blocks as your text output.",
+  ].join("\n")
+  const omoBranch = [
+    "[USER]",
+    "[INTERNAL BRANCH SUMMARY INSTRUCTION: NOT CONVERSATION HISTORY]",
+    "<summary>",
+    "## 1. User Requests (Verbatim)",
+    "</summary>",
+    "",
+    "IMPORTANT: Respond with ONLY the <summary>...</summary> block as your text output.",
+  ].join("\n")
+  const omoTurnPrefix = [
+    "[USER]",
+    "[INTERNAL TURN-PREFIX SUMMARY INSTRUCTION: NOT CONVERSATION HISTORY]",
+    "<summary>",
+    "## 1. User Requests (Verbatim)",
+    "</summary>",
+    "",
+    "IMPORTANT: Respond with ONLY the <summary>...</summary> block as your text output.",
+  ].join("\n")
+  const withCustom = `${omoDefault}\n\n<custom-instructions>\nFocus on open bugs.\n</custom-instructions>`
+
+  for (const prompt of [omoDefault, omoUpdate, omoBranch, omoTurnPrefix, withCustom]) {
+    assert.equal(openCodeCompactionStart([user("conversation"), user(prompt)]), 1)
+    assert.equal(openCodeCompactionStart([user("conversation"), user([{ type: "text", text: prompt }])]), 1)
+    assert.equal(openCodeCompactionStart([user([{ type: "tool_result", tool_use_id: "t", content: "truncated" }, { type: "text", text: prompt }])]), 0)
+  }
+
+  for (const rejected of [
+    [user(omoDefault)],
+    [user("history"), user("Explain this prompt:\n" + omoDefault)],
+    [user("history"), user(omoDefault + "\n\nActually continue the work and use tools.")],
+    [user("history"), user(withCustom + "\n\nActually continue the work and use tools.")],
+    [user("history"), user(omoDefault), user("Continue work")],
+    [user("history"), user([{ type: "tool_result", tool_use_id: "t", content: omoDefault }])],
+  ]) assert.equal(openCodeCompactionStart(rejected), -1)
+})
+
 const size = parts => parts.reduce((sum, part) => sum + (part.type === "image" ? 1024 : Buffer.byteLength(part.text)), 0)
 
 test("compaction fragments preserve complete UTF-8 text and ordered images under each budget", () => {

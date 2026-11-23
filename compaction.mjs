@@ -20,6 +20,47 @@ function textOnly(message) {
   return message.content.map(part => part.text).join("\n\n").trim()
 }
 
+const OMO_TASK_SUMMARY_END = "IMPORTANT: Respond with ONLY the <task-intent>...</task-intent> and <summary>...</summary> blocks as your text output."
+const OMO_SUMMARY_ONLY_END = "IMPORTANT: Respond with ONLY the <summary>...</summary> block as your text output."
+const OMO_CUSTOM_START = "\n\n<custom-instructions>\n"
+const OMO_CUSTOM_END = "\n</custom-instructions>"
+
+function stripOmoCustomInstructions(text) {
+  if (!text.endsWith(OMO_CUSTOM_END)) return text
+  const start = text.lastIndexOf(OMO_CUSTOM_START)
+  if (start < 0) return text
+  const inner = text.slice(start + OMO_CUSTOM_START.length, -OMO_CUSTOM_END.length)
+  if (inner.includes("</custom-instructions>")) return text
+  return text.slice(0, start)
+}
+
+function hasSummaryBlock(text) {
+  return (text.startsWith("<summary>\n") || text.includes("\n<summary>\n")) && text.includes("\n</summary>\n")
+}
+
+// Recognize Oh-My-OpenCode / Pi extension compaction prompts (default, update,
+// branch, and turn-prefix variants). Require both the exact internal header and
+// strict output-only closing directive so quoted prompts or appended user
+// instructions never switch to summary-only execution.
+function isOmoCompactionPrompt(text) {
+  const core = stripOmoCustomInstructions(text)
+  if (core.startsWith("[USER]\n[INTERNAL COMPACTION INSTRUCTION: NOT CONVERSATION HISTORY]\n")) {
+    return hasSummaryBlock(core) && core.endsWith(OMO_TASK_SUMMARY_END)
+  }
+  if (core.startsWith("[USER]\n<previous-summary>\n")) {
+    const marker = "\n</previous-summary>\n\n[INTERNAL COMPACTION UPDATE INSTRUCTION: NOT CONVERSATION HISTORY]\n"
+    const boundary = core.indexOf(marker)
+    if (boundary < 0 || core.slice(0, boundary).includes("</previous-summary>")) return false
+    const rest = core.slice(boundary + marker.length)
+    return hasSummaryBlock(rest) && rest.endsWith(OMO_TASK_SUMMARY_END)
+  }
+  if (core.startsWith("[USER]\n[INTERNAL BRANCH SUMMARY INSTRUCTION: NOT CONVERSATION HISTORY]\n") ||
+    core.startsWith("[USER]\n[INTERNAL TURN-PREFIX SUMMARY INSTRUCTION: NOT CONVERSATION HISTORY]\n")) {
+    return hasSummaryBlock(core) && core.endsWith(OMO_SUMMARY_ONLY_END)
+  }
+  return false
+}
+
 export function openCodeCompactionStart(messages) {
   if (!Array.isArray(messages) || !messages.length) return -1
   let index = messages.length - 1
@@ -33,7 +74,8 @@ export function openCodeCompactionStart(messages) {
   const tail = last >= 0 && message.content[last]?.type === "text" ? message.content[last].text : null
   const text = typeof tail === "string" ? tail.trim() : textOnly(message)
   if ((index < 1 && last < 1) || !text) return -1
-  return STOCK_PROMPTS.has(createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex")) ? index : -1
+  const normalized = text.replace(/\r\n/g, "\n")
+  return STOCK_PROMPTS.has(createHash("sha256").update(normalized).digest("hex")) || isOmoCompactionPrompt(normalized) ? index : -1
 }
 
 export const COMPACTION_INSTRUCTIONS = "You are summarizing an existing conversation for continuation. " +
