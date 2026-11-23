@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.3
+
+- Recognize Oh-My-OpenCode / Pi extension compaction prompts (default, update, branch, and turn-prefix variants) in `openCodeCompactionStart` so compaction requests with pruned or truncated historical `tool_result` blocks run in the isolated tool-free `:compaction` session instead of triggering HTTP 409 `conflicting duplicate result` or interfering with the live ACP turn.
+- Fold client-split batching tool calls (such as Hermes Agent unrolling a single `tool_call({"calls": [...]})` into one `toolu_*` call plus synthetic `call_<hex>` IDs) back into the original bridge call and merged tool result before validation and history matching, preventing HTTP 409 `some tool results do not belong to the active response` while leaving separate bridge-issued calls untouched.
+
 ## 0.9.2
 
 - Sign an existing named account in again from **Add a Google account** or **Import an account** by entering its name (case-insensitive). Only its credential file is replaced, staged in the same folder and renamed over the old one; conversations, settings and logs stay, and any failure keeps the previous credential. Previously an existing folder refused the name, so an account whose Magpie row had been removed could not be added back. Manifest imports still never overwrite.
