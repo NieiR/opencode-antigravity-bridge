@@ -662,3 +662,390 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     }
   }
 })
+
+test("OmO auto-compaction with truncated answered tool_result isolates cleanly without 409", async () => {
+  const workRoot = path.join(root, "omo-compact-work")
+  const accountsDir = path.join(root, "omo-compact-accounts")
+  const stateFile = path.join(root, "omo-compact-state.json")
+  const fakeDir = path.join(root, "fake-omo-compact-agy")
+  const logFile = path.join(root, "omo-compact.jsonl")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const logFile = process.env.FAKE_OMO_LOG;
+const record = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n");
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let sessionSeq = 0;
+let sessionId = "s-0";
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function connectControl(payload) {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, ...payload }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      const msg = JSON.parse(buf.slice(0, nl));
+      resolve(msg);
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    sessionId = "s-" + (++sessionSeq);
+    const listReply = await connectControl({ kind: "list" });
+    record({ type: "session/new", sessionId, toolCount: Array.isArray(listReply?.result?.tools) ? listReply.result.tools.length : -1 });
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId, models: { currentModelId: "gemini-test", availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+  } else if (msg.method === "session/prompt") {
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    if (text.includes("[INTERNAL COMPACTION INSTRUCTION: NOT CONVERSATION HISTORY]")) {
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "<task-intent>ok</task-intent>\\n<summary>compacted</summary>" } } } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      return;
+    }
+    void (async () => {
+      const r1 = await connectControl({ kind: "call", name: "echo", arguments: { text: "step-1" } });
+      record({ type: "mcpResult", step: 1, r: r1 });
+      const r2 = await connectControl({ kind: "call", name: "echo", arguments: { text: "step-2" } });
+      record({ type: "mcpResult", step: 2, r: r2 });
+      send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "primary-done" } } } });
+      send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+    })();
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    FAKE_OMO_LOG: process.env.FAKE_OMO_LOG,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = workRoot
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.FAKE_OMO_LOG = logFile
+  const echoTool = { name: "echo", input_schema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } }
+  const omoPrompt = [
+    "[USER]",
+    "[INTERNAL COMPACTION INSTRUCTION: NOT CONVERSATION HISTORY]",
+    "This message is an internal summarization control prompt, not a real user message.",
+    "",
+    "<summary>",
+    "## 1. User Requests (Verbatim)",
+    "</summary>",
+    "",
+    "IMPORTANT: Respond with ONLY the <task-intent>...</task-intent> and <summary>...</summary> blocks as your text output.",
+  ].join("\n")
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-omo-compact=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const base = { model: "gemini-test", stream: false, metadata: { user_id: "u-omo-compact" }, tools: [echoTool] }
+
+    const res1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ ...base, messages: [{ role: "user", content: "run two steps" }] }),
+    })
+    const body1 = await res1.json()
+    assert.equal(res1.status, 200, JSON.stringify(body1))
+    const call1 = body1.content.find(b => b.type === "tool_use")
+    assert.ok(call1?.id)
+
+    const fullStep1 = "FULL_ORIGINAL_OUTPUT_" + "x".repeat(5000)
+    const afterStep1 = [
+      { role: "user", content: "run two steps" },
+      { role: "assistant", content: body1.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: call1.id, content: fullStep1 }] },
+    ]
+    const res2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ ...base, messages: afterStep1 }),
+    })
+    const body2 = await res2.json()
+    assert.equal(res2.status, 200, JSON.stringify(body2))
+    const call2 = body2.content.find(b => b.type === "tool_use")
+    assert.ok(call2?.id && call2.id !== call1.id)
+
+    // OmO auto-compaction cuts right after step 1 and truncates step 1's tool_result
+    // while step 2 is still pending on the live ACP turn.
+    const compactMessages = [
+      { role: "user", content: "run two steps" },
+      { role: "assistant", content: body1.content },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: call1.id, content: "FULL_ORIGINAL_OUTPUT_<truncated:5021 bytes original>" }] },
+      { role: "user", content: [{ type: "text", text: omoPrompt }] },
+    ]
+    const compactRes = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ ...base, messages: compactMessages }),
+    })
+    const compactBody = await compactRes.json()
+    assert.equal(compactRes.status, 200, JSON.stringify(compactBody))
+    assert.equal(compactBody.stop_reason, "end_turn")
+    assert.ok(compactBody.content.some(b => b.type === "text" && b.text.includes("<summary>compacted</summary>")), JSON.stringify(compactBody))
+
+    // Primary pending step 2 still completes in its original live session.
+    const res3 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        ...base,
+        messages: [
+          ...afterStep1,
+          { role: "assistant", content: body2.content },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: call2.id, content: "step-2-ok" }] },
+        ],
+      }),
+    })
+    const body3 = await res3.json()
+    assert.equal(res3.status, 200, JSON.stringify(body3))
+    assert.equal(body3.stop_reason, "end_turn")
+    assert.ok(body3.content.some(b => b.type === "text" && b.text.includes("primary-done")), JSON.stringify(body3))
+
+    const events = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    const sessions = events.filter(e => e.type === "session/new")
+    assert.equal(sessions.length, 2, JSON.stringify(sessions))
+    assert.equal(sessions[0].toolCount, 1, JSON.stringify(sessions))
+    assert.equal(sessions[1].toolCount, 0, JSON.stringify(sessions))
+    const mcpResults = events.filter(e => e.type === "mcpResult")
+    assert.equal(mcpResults.length, 2)
+    assert.equal(mcpResults[0].r.result.content[0].text, fullStep1)
+    assert.equal(mcpResults[1].r.result.content[0].text, "step-2-ok")
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
+
+test("Hermes split batch tool_call folds back into one MCP result and preserves separate bridge calls", async () => {
+  const workRoot = path.join(root, "hermes-split-work")
+  const accountsDir = path.join(root, "hermes-split-accounts")
+  const stateFile = path.join(root, "hermes-split-state.json")
+  const fakeDir = path.join(root, "fake-hermes-split-agy")
+  const logFile = path.join(root, "hermes-split.jsonl")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import net from "node:net";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const logFile = process.env.FAKE_HERMES_LOG;
+const record = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n");
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let sessionSeq = 0;
+let sessionId = "s-0";
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+function connectControl(payload) {
+  return new Promise((resolve, reject) => {
+    const port = Number(process.env.AGY_BRIDGE_CONTROL_PORT);
+    const token = process.env.AGY_BRIDGE_TOKEN;
+    const sock = net.createConnection({ host: "127.0.0.1", port }, () => {
+      sock.write(JSON.stringify({ token, ...payload }) + "\\n");
+    });
+    let buf = "";
+    sock.on("data", chunk => {
+      buf += chunk.toString("utf8");
+      const nl = buf.indexOf("\\n");
+      if (nl < 0) return;
+      const msg = JSON.parse(buf.slice(0, nl));
+      resolve(msg);
+      sock.destroy();
+    });
+    sock.on("error", reject);
+  });
+}
+readline.createInterface({ input: process.stdin }).on("line", async line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    sessionId = "s-" + (++sessionSeq);
+    record({ type: "session/new", sessionId });
+    await connectControl({ kind: "list" });
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId, models: { currentModelId: "gemini-test", availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+  } else if (msg.method === "session/prompt") {
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("\\n");
+    if (text.includes("SPLIT_BATCH")) {
+      void (async () => {
+        const r = await connectControl({
+          kind: "call",
+          name: "tool_call",
+          arguments: { calls: [{ name: "news", q: "a" }, { name: "news", q: "b" }, { name: "news", q: "c" }] },
+        });
+        record({ type: "mcpResult", kind: "batch", r });
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "batch-done" } } } });
+        send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      })();
+      return;
+    }
+    if (text.includes("TWO_SEPARATE")) {
+      void (async () => {
+        const r1 = await connectControl({ kind: "call", name: "tool_call", arguments: { calls: [{ name: "x" }] } });
+        record({ type: "mcpResult", kind: "separate", r: r1 });
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "separate-done" } } } });
+        send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+      })();
+      return;
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "followup-reused" } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    FAKE_HERMES_LOG: process.env.FAKE_HERMES_LOG,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = workRoot
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  process.env.FAKE_HERMES_LOG = logFile
+  const batchTool = {
+    name: "tool_call",
+    input_schema: {
+      type: "object",
+      properties: { calls: { type: "array", items: { type: "object" } } },
+      required: ["calls"],
+    },
+  }
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-hermes-split=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+
+    // 1. Split batch tool_call round + follow-up session reuse
+    const splitBase = { model: "gemini-test", stream: false, metadata: { user_id: "u-hermes-split" }, tools: [batchTool] }
+    const res1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ ...splitBase, messages: [{ role: "user", content: "SPLIT_BATCH" }] }),
+    })
+    const body1 = await res1.json()
+    assert.equal(res1.status, 200, JSON.stringify(body1))
+    const use = body1.content.find(b => b.type === "tool_use")
+    assert.equal(use?.name, "tool_call")
+    assert.equal(use?.input?.calls?.length, 3)
+
+    const splitIds = [use.id, "call_30ceee0cd868", "call_ab3d603d00f3"]
+    const splitMessages = [
+      { role: "user", content: "SPLIT_BATCH" },
+      {
+        role: "assistant",
+        content: use.input.calls.map((entry, idx) => ({
+          type: "tool_use",
+          id: splitIds[idx],
+          name: "tool_call",
+          input: { calls: [entry] },
+        })),
+      },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: splitIds[0], content: "res-a" }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: splitIds[1], content: "res-b" }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: splitIds[2], content: "res-c" }] },
+    ]
+    const res2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ ...splitBase, messages: splitMessages }),
+    })
+    const body2 = await res2.json()
+    assert.equal(res2.status, 200, JSON.stringify(body2))
+    assert.equal(body2.stop_reason, "end_turn")
+    assert.ok(body2.content.some(b => b.type === "text" && b.text.includes("batch-done")), JSON.stringify(body2))
+
+    // Follow-up turn keeping Hermes's split history reuses the live session without replay.
+    const res3 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        ...splitBase,
+        messages: [...splitMessages, { role: "assistant", content: body2.content }, { role: "user", content: "next question" }],
+      }),
+    })
+    const body3 = await res3.json()
+    assert.equal(res3.status, 200, JSON.stringify(body3))
+    assert.ok(body3.content.some(b => b.type === "text" && b.text.includes("followup-reused")), JSON.stringify(body3))
+
+    const eventsAfterSplit = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    assert.equal(eventsAfterSplit.filter(e => e.type === "session/new").length, 1, JSON.stringify(eventsAfterSplit))
+    const batchMcp = eventsAfterSplit.find(e => e.type === "mcpResult" && e.kind === "batch")
+    assert.equal(batchMcp.r.result.isError, false)
+    const batchText = batchMcp.r.result.content.map(p => p.text).join("\n")
+    assert.match(batchText, /res-a[\s\S]*res-b[\s\S]*res-c/)
+
+    // 2. Two bridge-shaped toolu_<24hex> calls in the same assistant message are never folded.
+    const sepBase = { model: "gemini-test", stream: false, metadata: { user_id: "u-hermes-separate" }, tools: [batchTool] }
+    const sep1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({ ...sepBase, messages: [{ role: "user", content: "TWO_SEPARATE" }] }),
+    })
+    const sepBody1 = await sep1.json()
+    assert.equal(sep1.status, 200, JSON.stringify(sepBody1))
+    const sepUse = sepBody1.content.find(b => b.type === "tool_use")
+    assert.ok(sepUse?.id)
+    const bogusBridgeId = "toolu_0123456789abcdef01234567"
+    const notFolded = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        ...sepBase,
+        messages: [
+          { role: "user", content: "TWO_SEPARATE" },
+          {
+            role: "assistant",
+            content: [
+              sepUse,
+              { type: "tool_use", id: bogusBridgeId, name: "tool_call", input: { calls: [{ name: "y" }] } },
+            ],
+          },
+          {
+            role: "user",
+            content: [
+              { type: "tool_result", tool_use_id: sepUse.id, content: "sep-0" },
+              { type: "tool_result", tool_use_id: bogusBridgeId, content: "sep-1" },
+            ],
+          },
+        ],
+      }),
+    })
+    assert.equal(notFolded.status, 409)
+    const sep2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        ...sepBase,
+        messages: [
+          { role: "user", content: "TWO_SEPARATE" },
+          { role: "assistant", content: sepBody1.content },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: sepUse.id, content: "sep-0" }] },
+        ],
+      }),
+    })
+    const sepBody2 = await sep2.json()
+    assert.equal(sep2.status, 200, JSON.stringify(sepBody2))
+    assert.equal(sepBody2.stop_reason, "end_turn")
+    assert.ok(sepBody2.content.some(b => b.type === "text" && b.text.includes("separate-done")), JSON.stringify(sepBody2))
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
