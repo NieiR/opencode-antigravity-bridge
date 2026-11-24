@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.4
+
+- Progressively fit oversized recognized compaction snapshots within the bridge prompt and fragment budgets instead of immediately failing with HTTP 400 `prompt_budget_exceeded`: keep requests lossless when already in budget, then omit external system instructions, compact `tool_record` wrappers and proportionally head+tail truncate bulky `tool_result` bodies (UTF-8 safe), fall back to omitting historical `tool_result` bodies, and finally drop the oldest complete removable history groups while protecting opening context, prior summaries, the latest user task, and the compaction prompt. Truly irreducible inputs still fail fast with HTTP 400 before session creation.
+
 ## 0.9.3
 
 - Recognize Oh-My-OpenCode / Pi extension compaction prompts (default, update, branch, and turn-prefix variants) in `openCodeCompactionStart` so compaction requests with pruned or truncated historical `tool_result` blocks run in the isolated tool-free `:compaction` session instead of triggering HTTP 409 `conflicting duplicate result` or interfering with the live ACP turn.
