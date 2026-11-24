@@ -1049,3 +1049,171 @@ readline.createInterface({ input: process.stdin }).on("line", async line => {
     }
   }
 })
+
+test("oversized OmO compaction compacts bulky tool_results and old exchanges under 1 MiB without 400", async () => {
+  const workRoot = path.join(root, "omo-big-compact-work")
+  const accountsDir = path.join(root, "omo-big-compact-accounts")
+  const stateFile = path.join(root, "omo-big-compact-state.json")
+  const fakeDir = path.join(root, "fake-omo-big-compact-agy")
+  const logFile = path.join(root, "omo-big-compact.jsonl")
+  const fakeBin = writeFakeAgy(fakeDir, `
+import fs from "node:fs";
+import readline from "node:readline";
+const args = process.argv.slice(2);
+const logFile = process.env.FAKE_BIG_COMPACT_LOG;
+const record = (entry) => fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n");
+if (args.includes("--version")) { console.log("1.5.9"); process.exit(0); }
+if (args.includes("models")) { console.log("gemini-test  Gemini Test"); process.exit(0); }
+let sessionSeq = 0;
+let sessionId = "s-0";
+const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", line => {
+  const msg = JSON.parse(line);
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: { image: true } }, agentInfo: { name: "fake-agy", version: "1.5.9" } } });
+  } else if (msg.method === "session/new") {
+    sessionId = "s-" + (++sessionSeq);
+    record({ type: "session/new", sessionId });
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId, models: { currentModelId: "gemini-test", availableModels: [{ modelId: "gemini-test", name: "Gemini Test" }] } } });
+  } else if (msg.method === "session/prompt") {
+    const text = (msg.params?.prompt || []).map(p => p.text || "").join("");
+    record({ type: "prompt", sessionId, bytes: Buffer.byteLength(text, "utf8"), text });
+    const isFinal = text.includes("Produce only the final summary now") || !text.includes("[Bridge compaction fragment ");
+    const reply = isFinal ? "<task-intent>ok</task-intent>\\n<summary>compacted-ok</summary>" : "ACK";
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});
+`)
+  const prev = {
+    AGY_PATH: process.env.AGY_PATH,
+    AGY_BRIDGE_CONVERSATIONS_DIR: process.env.AGY_BRIDGE_CONVERSATIONS_DIR,
+    AGY_BRIDGE_ACCOUNTS_DIR: process.env.AGY_BRIDGE_ACCOUNTS_DIR,
+    AGY_BRIDGE_STATE_FILE: process.env.AGY_BRIDGE_STATE_FILE,
+    AGY_BRIDGE_USAGE: process.env.AGY_BRIDGE_USAGE,
+    AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES: process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES,
+    FAKE_BIG_COMPACT_LOG: process.env.FAKE_BIG_COMPACT_LOG,
+  }
+  process.env.AGY_PATH = fakeBin
+  process.env.AGY_BRIDGE_CONVERSATIONS_DIR = workRoot
+  process.env.AGY_BRIDGE_ACCOUNTS_DIR = accountsDir
+  process.env.AGY_BRIDGE_STATE_FILE = stateFile
+  process.env.AGY_BRIDGE_USAGE = "0"
+  delete process.env.AGY_BRIDGE_MAX_PROMPT_TEXT_BYTES
+  process.env.FAKE_BIG_COMPACT_LOG = logFile
+
+  const omoPrompt = [
+    "[USER]",
+    "[INTERNAL COMPACTION INSTRUCTION: NOT CONVERSATION HISTORY]",
+    "This message is an internal summarization control prompt, not a real user message.",
+    "",
+    "<summary>",
+    "## 1. User Requests (Verbatim)",
+    "</summary>",
+    "",
+    "IMPORTANT: Respond with ONLY the <task-intent>...</task-intent> and <summary>...</summary> blocks as your text output.",
+  ].join("\n")
+
+  try {
+    const { AntigravityBridgePlugin } = await import(`./index.mjs?fixes-big-compact=${Date.now()}`)
+    const plugin = await AntigravityBridgePlugin()
+    const loader = await plugin.auth.loader()
+    const readTool = { name: "read", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }
+
+    // 1. ~1.35 MB OmO compaction dominated by bulky tool_result bodies (multi-byte UTF-8) + 60 KB system prompt.
+    const toolMessages = [{ role: "user", content: "OPENING_TASK_KEEP_ME" }]
+    for (let i = 0; i < 36; i++) {
+      const id = `toolu_${String(i).padStart(24, "0")}`
+      toolMessages.push({
+        role: "assistant",
+        content: [{ type: "tool_use", id, name: "read", input: { path: `src/file_${i}.cs` } }],
+      })
+      const payload = i === 0
+        ? "SMALL_RESULT_KEEP_VERBATIM"
+        : `HEAD_MARKER_${i}_` + "中A😀".repeat(6500) + `_TAIL_MARKER_${i}`
+      toolMessages.push({
+        role: "user",
+        content: [{ type: "tool_result", tool_use_id: id, content: payload }],
+      })
+    }
+    toolMessages.push({ role: "user", content: [{ type: "text", text: omoPrompt }] })
+
+    const res1 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        system: "SYS_PROMPT_".repeat(6000),
+        metadata: { user_id: "u-big-compact-tools" },
+        tools: [readTool],
+        messages: toolMessages,
+      }),
+    })
+    const body1 = await res1.json()
+    assert.equal(res1.status, 200, JSON.stringify(body1))
+    assert.equal(body1.stop_reason, "end_turn")
+    assert.ok(body1.content.some(b => b.type === "text" && b.text.includes("<summary>compacted-ok</summary>")))
+
+    const events1 = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse)
+    const prompts1 = events1.filter(e => e.type === "prompt")
+    assert.ok(prompts1.length >= 2)
+    assert.ok(prompts1.every(p => p.bytes <= 180_000), "every ACP fragment stays under 180 KB")
+    const totalBytes1 = prompts1.reduce((sum, p) => sum + p.bytes, 0)
+    assert.ok(totalBytes1 <= 1024 * 1024, `total bytes ${totalBytes1} must fit 1 MiB`)
+    const combined1 = prompts1.map(p => p.text).join("\n")
+    assert.ok(!combined1.includes("\ufffd"), "UTF-8 truncation must not produce replacement chars")
+    assert.ok(combined1.includes("OPENING_TASK_KEEP_ME"))
+    assert.ok(combined1.includes("SMALL_RESULT_KEEP_VERBATIM"))
+    assert.ok(combined1.includes("HEAD_MARKER_35_") && combined1.includes("_TAIL_MARKER_35"))
+
+    // 2. >1.2 MB multi-exchange text history (no tool results) drops oldest removable middle exchanges and succeeds.
+    const before2 = events1.length
+    const textMessages = [{ role: "user", content: "OPENING_TEXT_TASK" }]
+    for (let i = 0; i < 20; i++) {
+      textMessages.push({ role: "assistant", content: `TURN_${i}_` + "y".repeat(65000) })
+      textMessages.push({ role: "user", content: i === 19 ? "LATEST_REAL_TASK" : `[MESSAGE FROM NON-USER SOURCE - NOT USER INPUT] tick ${i}` })
+    }
+    textMessages.push({ role: "assistant", content: "FINAL_ASSISTANT_TURN" })
+    textMessages.push({ role: "user", content: [{ type: "text", text: omoPrompt }] })
+
+    const res2 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: "u-big-compact-text" },
+        messages: textMessages,
+      }),
+    })
+    const body2 = await res2.json()
+    assert.equal(res2.status, 200, JSON.stringify(body2))
+    const prompts2 = fs.readFileSync(logFile, "utf8").trim().split("\n").map(JSON.parse).slice(before2).filter(e => e.type === "prompt")
+    const combined2 = prompts2.map(p => p.text).join("\n")
+    assert.ok(combined2.includes("OPENING_TEXT_TASK"))
+    assert.ok(combined2.includes("LATEST_REAL_TASK"))
+    assert.ok(combined2.includes("FINAL_ASSISTANT_TURN"))
+    assert.ok(prompts2.reduce((sum, p) => sum + p.bytes, 0) <= 1024 * 1024)
+
+    // 3. Truly irreducible single user message >1 MiB still rejects with 400 prompt_budget_exceeded before spawning.
+    const before3 = fs.readFileSync(logFile, "utf8").trim().split("\n").length
+    const res3 = await loader.fetch("agy://local/messages", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "gemini-test",
+        stream: false,
+        metadata: { user_id: "u-big-compact-irreducible" },
+        messages: [{ role: "user", content: "z".repeat(1100000) }, { role: "user", content: [{ type: "text", text: omoPrompt }] }],
+      }),
+    })
+    const body3 = await res3.json()
+    assert.equal(res3.status, 400, JSON.stringify(body3))
+    assert.equal(body3.error?.code, "prompt_budget_exceeded")
+    const after3 = fs.readFileSync(logFile, "utf8").trim().split("\n").length
+    assert.equal(after3, before3, "irreducible over-budget compaction must reject before session creation")
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})

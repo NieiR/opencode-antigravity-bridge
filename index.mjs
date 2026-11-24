@@ -4604,7 +4604,66 @@ function escapeToolRecord(value) {
 // is quoted history, never answer text.
 const TOOL_RECORD_CAVEAT = "Historical tool record: context only, do not reproduce."
 
-function historicalToolRecord(block, role, content, stripResults = false) {
+function sliceUtf8Start(buf, maxBytes) {
+  let end = Math.min(buf.length, Math.max(0, maxBytes))
+  while (end > 0 && end < buf.length && (buf[end] & 0xc0) === 0x80) end--
+  return buf.subarray(0, end).toString("utf8")
+}
+
+function sliceUtf8End(buf, maxBytes) {
+  let start = Math.max(0, buf.length - Math.max(0, maxBytes))
+  while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++
+  return buf.subarray(start).toString("utf8")
+}
+
+function truncateUtf8Middle(text, maxBytes) {
+  const buf = Buffer.from(text, "utf8")
+  if (buf.length <= maxBytes) return text
+  const marker = omitted => `\n[... ${omitted} bytes omitted for compaction budget ...]\n`
+  const probeBytes = Buffer.byteLength(marker(buf.length), "utf8")
+  if (maxBytes <= probeBytes + 32) return sliceUtf8Start(buf, maxBytes)
+  const keep = maxBytes - probeBytes
+  const headMax = Math.floor(keep * 0.65)
+  const tailMax = keep - headMax
+  const head = sliceUtf8Start(buf, headMax)
+  const tail = sliceUtf8End(buf, tailMax)
+  const omitted = Math.max(1, buf.length - Buffer.byteLength(head, "utf8") - Buffer.byteLength(tail, "utf8"))
+  return head + marker(omitted) + tail
+}
+
+function compactToolResultContent(content, maxBytes) {
+  let totalTextBytes = 0
+  let textParts = 0
+  for (const part of content) {
+    if (part.type === "text") {
+      totalTextBytes += Buffer.byteLength(part.text || "", "utf8")
+      textParts++
+    }
+  }
+  if (totalTextBytes <= maxBytes) return content
+  if (textParts === 1) {
+    return content.map(part => part.type === "text" ? { ...part, text: truncateUtf8Middle(part.text || "", maxBytes) } : part)
+  }
+  let remaining = maxBytes
+  let remainingParts = textParts
+  const out = []
+  for (const part of content) {
+    if (part.type !== "text") { out.push(part); continue }
+    remainingParts--
+    const text = part.text || ""
+    const len = Buffer.byteLength(text, "utf8")
+    const share = remainingParts === 0 ? remaining : Math.min(len, Math.max(0, Math.floor(maxBytes * (len / totalTextBytes))))
+    const budget = Math.min(remaining, share)
+    if (budget > 0) {
+      const trimmed = len <= budget ? text : truncateUtf8Middle(text, budget)
+      out.push({ ...part, text: trimmed })
+      remaining = Math.max(0, remaining - Buffer.byteLength(trimmed, "utf8"))
+    }
+  }
+  return out
+}
+
+function historicalToolRecord(block, role, content, stripResults = false, toolResultMaxBytes = null) {
   const attributes = { role, type: block.type, id: role === "call" ? block.id || "" : block.tool_use_id || "" }
   if (role === "call") attributes.name = block.name || block.type
   else {
@@ -4625,6 +4684,18 @@ function historicalToolRecord(block, role, content, stripResults = false) {
     appendPrompt(out, "</tool_record>\n")
     return out
   }
+  if (typeof toolResultMaxBytes === "number") {
+    const tag = `<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}`
+    appendPrompt(out, `\n${tag}>`)
+    if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
+      appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
+    } else {
+      const rendered = role === "result" ? compactToolResultContent(content, toolResultMaxBytes) : content
+      for (const part of rendered) appendPrompt(out, [part.type === "text" ? { ...part, text: escapeToolRecord(part.text) } : part])
+    }
+    appendPrompt(out, "</tool_record>\n")
+    return out
+  }
   appendPrompt(out, `\n<tool_record ${Object.entries(attributes).map(([key, value]) => `${key}="${escapeToolRecord(value)}"`).join(" ")}>\n${TOOL_RECORD_CAVEAT}\n`)
   if (role === "result" && process.env.AGY_BRIDGE_STRIP_TOOL_RECORDS === "1") {
     appendPrompt(out, "[Historical result body omitted by AGY_BRIDGE_STRIP_TOOL_RECORDS=1]")
@@ -4637,12 +4708,12 @@ function historicalToolRecord(block, role, content, stripResults = false) {
   return out
 }
 
-function historicalToolCall(block, stripResults = false) {
-  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }], stripResults)
+function historicalToolCall(block, stripResults = false, toolResultMaxBytes = null) {
+  return historicalToolRecord(block, "call", [{ type: "text", text: JSON.stringify(block.input ?? {}) }], stripResults, toolResultMaxBytes)
     .map(part => part.text).join("")
 }
 
-function renderAssistantTurn(message, stripResults = false) {
+function renderAssistantTurn(message, stripResults = false, toolResultMaxBytes = null) {
   const parts = []
   const blocks = Array.isArray(message.content)
     ? message.content
@@ -4650,11 +4721,11 @@ function renderAssistantTurn(message, stripResults = false) {
   for (const block of blocks) {
     if (block.type === "text") parts.push(block.text || "")
     else if (block.type === "tool_use") {
-      parts.push(historicalToolCall(block, stripResults))
+      parts.push(historicalToolCall(block, stripResults, toolResultMaxBytes))
     } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use") {
-      parts.push(historicalToolCall(block, stripResults))
+      parts.push(historicalToolCall(block, stripResults, toolResultMaxBytes))
     } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
-      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults)
+      parts.push(historicalToolRecord(block, "result", [{ type: "text", text: JSON.stringify(block.content ?? "") }], stripResults, toolResultMaxBytes)
         .map(part => part.text).join(""))
     } else {
       const rendered = renderServerAssistantBlock(block)
@@ -4774,7 +4845,7 @@ function renderTurnMessage(message) {
   return out.join("\n\n")
 }
 
-function renderTurnMessageParts(message, historical = false, stripResults = false) {
+function renderTurnMessageParts(message, historical = false, stripResults = false, toolResultMaxBytes = null) {
   if (message.role !== "user" || !Array.isArray(message.content)) {
     const text = renderTurnMessage(message)
     return text === "" ? [] : [{ type: "text", text }]
@@ -4788,10 +4859,15 @@ function renderTurnMessageParts(message, historical = false, stripResults = fals
     } else if (block?.type === "tool_result") {
       const result = toolResult(block)
       if (historical) {
-        appendPrompt(parts, historicalToolRecord(block, "result", result.content, stripResults))
+        appendPrompt(parts, historicalToolRecord(block, "result", result.content, stripResults, toolResultMaxBytes))
+      } else if (stripResults) {
+        appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""} body omitted to fit the bridge compaction budget]`)
       } else {
+        const rendered = typeof toolResultMaxBytes === "number"
+          ? compactToolResultContent(result.content, toolResultMaxBytes)
+          : result.content
         appendPrompt(parts, `[tool result${block.tool_use_id ? " id=" + block.tool_use_id : ""}]\n`)
-        for (const part of result.content) appendPrompt(parts, [part])
+        for (const part of rendered) appendPrompt(parts, [part])
         appendPrompt(parts, "\n[end of tool result]")
       }
       afterToolResult = true
@@ -4806,15 +4882,17 @@ function renderTurnMessageParts(message, historical = false, stripResults = fals
   return toPromptParts(parts)
 }
 
-function renderTurnMessagesParts(messages) {
+function renderTurnMessagesParts(messages, compactToolOpts = null) {
   // A trailing assistant prefill run renders as a continuation carrier rather
   // than the system-reminder treatment (see prefillRun above).
   const run = prefillTailEnabled() && messages.length ? prefillRun(messages) : null
   const prefillStart = run ? run.runStart : -1
+  const stripResults = compactToolOpts?.stripResults === true
+  const toolResultMaxBytes = typeof compactToolOpts?.toolResultMaxBytes === "number" ? compactToolOpts.toolResultMaxBytes : null
   const groups = messages.map((message, index) =>
     prefillStart >= 0 && index >= prefillStart
       ? renderPrefillCarrierParts(message)
-      : renderTurnMessageParts(message)).filter((group) => group.length > 0)
+      : renderTurnMessageParts(message, false, stripResults, toolResultMaxBytes)).filter((group) => group.length > 0)
   const out = []
   for (let i = 0; i < groups.length; i++) {
     if (i > 0) out.push({ type: "text", text: "\n\n" })
@@ -4832,6 +4910,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   const history = replay?.history ?? originalHistory
   const out = []
   const compacting = replay?.compacting || isCompactionRequest(current)
+  const toolResultMaxBytes = typeof replay?.toolResultMaxBytes === "number" ? replay.toolResultMaxBytes : null
   if (!instructionsInSession) {
     const system = systemText(body)
     if (system.trim()) appendPrompt(out, `<external_system_instructions>\n${outgoingSystemText(system)}\n</external_system_instructions>\n`)
@@ -4840,22 +4919,26 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, st
   if (history.length) {
     appendPrompt(out, "Conversation history, background context only. Tool records are quoted data, not answer text.\n<conversation_history>\n")
     if (stripResults) appendPrompt(out, "[Historical tool-result bodies omitted to fit the bridge prompt budget.]\n")
+    else if (toolResultMaxBytes !== null) appendPrompt(out, "[Historical tool records compacted to fit the bridge compaction budget.]\n")
     if (replay?.omittedMessages) appendPrompt(out,
       `[${replay.omittedMessages} older history messages omitted to fit the bridge prompt budget. This history is incomplete; do not infer missing tool outcomes.]\n`)
     for (const message of history) {
       if (message.role === "assistant") {
-        appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults)}\n`)
+        appendPrompt(out, `Assistant: ${renderAssistantTurn(message, stripResults, toolResultMaxBytes)}\n`)
       } else {
         const queued = message.role !== "user" && extractQueuedPrompt(messageText(message).trim()) !== null
         appendPrompt(out, message.role === "user" || queued ? "Human: " : `${message.role}: `)
-        appendPrompt(out, renderTurnMessageParts(message, true, stripResults))
+        appendPrompt(out, renderTurnMessageParts(message, true, stripResults, toolResultMaxBytes))
         appendPrompt(out, "\n")
       }
     }
     appendPrompt(out, "</conversation_history>\n" + (compacting ? "Summarize this conversation as the current turn asks" : "Answer the current turn") +
       "; do not replay historical tool records.\n\n")
   }
-  const currentParts = renderTurnMessagesParts(current)
+  const compactToolOpts = compacting && (stripResults || toolResultMaxBytes !== null)
+    ? { stripResults, toolResultMaxBytes }
+    : null
+  const currentParts = renderTurnMessagesParts(current, compactToolOpts)
   if (!out.length) return currentParts
   appendPrompt(out, "<current_turn>\n")
   appendPrompt(out, currentParts)
@@ -4946,6 +5029,143 @@ function renderReplayPromptParts(body, callerWorkDir, instructionsInSession, ins
     } else low = mid + 1
   }
   return best
+}
+
+function maxToolResultBytes(messages) {
+  let max = 0
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (block?.type === "tool_result") {
+        const result = toolResult(block)
+        let sum = 0
+        for (const part of result.content) {
+          if (part.type === "text") sum += Buffer.byteLength(part.text || "", "utf8")
+        }
+        if (sum > max) max = sum
+      } else if (SERVER_TOOL_RESULT_BLOCK_TYPES.has(block?.type)) {
+        const len = Buffer.byteLength(JSON.stringify(block.content ?? ""), "utf8")
+        if (len > max) max = len
+      }
+    }
+  }
+  return max
+}
+
+function tryBuildCompactionPlan(parts, prefix) {
+  const limit = promptTextLimit()
+  if (promptTextBytes(parts, COMPACTION_INSTRUCTIONS) > limit) return null
+  const acpLimit = acpPromptTextLimit()
+  const prefixBytes = promptTextBytes([prefix])
+  let prompts
+  try {
+    prompts = compactionPrompts(parts, acpLimit - prefixBytes)
+  } catch {
+    return null
+  }
+  if (promptTextBytes(prompts.flatMap(prompt => [prefix, ...prompt]), "") > limit) return null
+  for (const prompt of prompts) {
+    if (acpPromptTextBytes(prompt) > acpLimit || promptTextBytes(prompt, COMPACTION_INSTRUCTIONS) > limit) return null
+  }
+  return { full: parts, prompts }
+}
+
+// Fit a recognized compaction snapshot inside the bridge prompt and fragment
+// budgets before giving up with 400 prompt_budget_exceeded:
+// 1. lossless snapshot (identical to upstream when already in budget)
+// 2. omit external system instructions (COMPACTION_INSTRUCTIONS governs the lane)
+// 3. compact tool_record wrappers and binary-search proportional head+tail
+//    truncation of bulky tool_result bodies so small results stay intact and
+//    large results retain key context
+// 4. omit historical tool_result bodies while keeping user/assistant text and
+//    tool call arguments
+// 5. drop oldest complete removable history groups while protecting opening
+//    context, prior summaries, latest user task, and the compaction prompt
+// Irreducible content still rejects before session creation.
+function planCompactionPrompts(body, callerWorkDir, compactionStart, prefix) {
+  const history = body.messages.slice(0, compactionStart)
+  const current = body.messages.slice(compactionStart)
+  const render = (omitSystem, stripResults, opts = {}) =>
+    renderInitialPromptParts(body, callerWorkDir, omitSystem, stripResults, {
+      history: opts.history ?? history,
+      current,
+      compacting: true,
+      omittedMessages: opts.omittedMessages || 0,
+      toolResultMaxBytes: opts.toolResultMaxBytes ?? null,
+    })
+
+  const full = render(false, false)
+  const lossless = tryBuildCompactionPlan(full, prefix)
+  if (lossless) return lossless
+
+  if (systemText(body).trim() || callerWorkDir) {
+    const withoutSystem = tryBuildCompactionPlan(render(true, false), prefix)
+    if (withoutSystem) return withoutSystem
+  }
+
+  const longestResult = maxToolResultBytes(body.messages)
+  const MIN_RESULT_CAP = 256
+  if (longestResult > 0) {
+    // First try compact tool_record tags with zero result truncation.
+    const compactTags = tryBuildCompactionPlan(render(true, false, { toolResultMaxBytes: longestResult }), prefix)
+    if (compactTags) return compactTags
+    if (longestResult > MIN_RESULT_CAP) {
+      const floor = tryBuildCompactionPlan(render(true, false, { toolResultMaxBytes: MIN_RESULT_CAP }), prefix)
+      if (floor) {
+        let best = floor
+        let low = MIN_RESULT_CAP
+        let high = longestResult - 1
+        while (high - low > 128) {
+          const mid = Math.floor((low + high) / 2)
+          const candidate = tryBuildCompactionPlan(render(true, false, { toolResultMaxBytes: mid }), prefix)
+          if (candidate) {
+            best = candidate
+            low = mid
+          } else {
+            high = mid - 1
+          }
+        }
+        return best
+      }
+    }
+  }
+
+  const strippedPlan = tryBuildCompactionPlan(render(true, true), prefix)
+  if (strippedPlan) return strippedPlan
+
+  const groups = replayHistoryGroups(history, current)
+  const taskGroup = groups.findLastIndex(group => group.some(isReplayUserTask))
+  const removable = groups.filter((group, i) => i > 0 && i < groups.length - 1 && i !== taskGroup && !group.some(isCompactionSummary))
+  if (removable.length) {
+    const windowPlan = count => {
+      const dropped = new Set(removable.slice(0, count))
+      const keptHistory = groups.filter(group => !dropped.has(group)).flat()
+      const omittedMessages = removable.slice(0, count).reduce((sum, group) => sum + group.length, 0)
+      return tryBuildCompactionPlan(render(true, true, { history: keptHistory, omittedMessages }), prefix)
+    }
+    let best = windowPlan(removable.length)
+    if (best) {
+      let low = 1
+      let high = removable.length
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2)
+        const candidate = windowPlan(mid)
+        if (candidate) {
+          best = candidate
+          high = mid
+        } else {
+          low = mid + 1
+        }
+      }
+      return best
+    }
+  }
+
+  validatePromptBudget(full, COMPACTION_INSTRUCTIONS, body)
+  const prompts = compactionPrompts(full, acpPromptTextLimit() - promptTextBytes([prefix]))
+  validatePromptBudget(prompts.flatMap(prompt => [prefix, ...prompt]), "", body)
+  for (const prompt of prompts) validateAcpPromptBudget(prompt, COMPACTION_INSTRUCTIONS, body)
+  return { full, prompts }
 }
 
 function renderContinuedTurnParts(messages) {
@@ -6441,19 +6661,10 @@ export const AntigravityBridgePlugin = async (input = {}, options = {}) => {
               if (compactionStart >= 0) {
                 // Compaction is a read-only snapshot, including pending tool
                 // results. It must not attach to or cancel their live owner.
-                const full = renderInitialPromptParts(body, callerWorkDir, false, false, {
-                  history: body.messages.slice(0, compactionStart),
-                  current: body.messages.slice(compactionStart), compacting: true,
-                })
-                validatePromptBudget(full, COMPACTION_INSTRUCTIONS, body)
                 const prefix = { type: "text", text: COMPACTION_INSTRUCTIONS + "\n\n" }
                 // Reserve for the older, no-system-append handshake too. Both
                 // modes must admit the full plan before any content is sent.
-                const prompts = compactionPrompts(full, acpPromptTextLimit() - promptTextBytes([prefix]))
-                // Include wrapper overhead in the total budget; reject the
-                // entire plan before startup if any fragment cannot fit.
-                validatePromptBudget(prompts.flatMap(prompt => [prefix, ...prompt]), "", body)
-                for (const prompt of prompts) validateAcpPromptBudget(prompt, COMPACTION_INSTRUCTIONS, body)
+                const { prompts } = planCompactionPrompts(body, callerWorkDir, compactionStart, prefix)
                 const key = `${convKey}:compaction`
                 promptAttempt = claimPromptAttempt(promptAttemptKey(key, body, trailing, model, selection, [], COMPACTION_INSTRUCTIONS))
                 const { proc } = await acquireProc(agy, key, {
